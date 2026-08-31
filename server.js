@@ -77,33 +77,57 @@ function sanitize(parsed) {
   return parsed;
 }
 
-async function callClaude(system, messages, maxTokens) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-5",
-      max_tokens: maxTokens,
-      system: system,
-      messages: messages,
-    }),
-  });
+async function callClaude(system, messages, maxTokens, retries = 1) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-5",
+          max_tokens: maxTokens,
+          system: system,
+          messages: messages,
+        }),
+      });
 
-  const data = await response.json();
-  if (!response.ok) {
-    console.error("Anthropic API error:", data);
-    throw new Error("Upstream API error.");
+      const data = await response.json();
+      if (!response.ok) {
+        const errType = data && data.error && data.error.type;
+        // Overloaded / rate-limited errors are worth one retry; auth/bad-request errors are not.
+        const isTransient = errType === "overloaded_error" || errType === "rate_limit_error" || response.status >= 500;
+        console.error("Anthropic API error:", data);
+        if (isTransient && attempt < retries) {
+          await new Promise((r) => setTimeout(r, 1200));
+          continue;
+        }
+        throw new Error((data && data.error && data.error.message) || "Upstream API error.");
+      }
+
+      const rawText = (data.content || [])
+        .map((block) => (block.type === "text" ? block.text : ""))
+        .join("");
+      const cleaned = rawText.replace(/```json|```/g, "").trim();
+
+      try {
+        return JSON.parse(cleaned);
+      } catch (parseErr) {
+        console.error("Failed to parse model output as JSON. Raw text was:\n", rawText);
+        // Truncated output (hit max_tokens mid-JSON) is the most common cause — worth one retry.
+        if (attempt < retries) {
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        }
+        throw new Error("Model response was truncated or malformed (try a shorter/simpler request).");
+      }
+    } catch (err) {
+      if (attempt >= retries) throw err;
+    }
   }
-
-  const rawText = (data.content || [])
-    .map((block) => (block.type === "text" ? block.text : ""))
-    .join("");
-  const cleaned = rawText.replace(/```json|```/g, "").trim();
-  return JSON.parse(cleaned);
 }
 
 const FIX_SYSTEM_PROMPT = `You are Studio Assist, helping fix an existing Roblox Luau script. You'll be given the current source of a script (and maybe some context about it). Your job is to find and fix real problems — syntax errors, wrong/outdated Roblox API usage, logic bugs, missing debounces, unconnected events, incomplete pieces, wrong script type for what it does — while preserving the original author's structure, naming, and intent as much as possible. Don't rewrite it from scratch or change its style/approach unless it's actually broken.
@@ -131,11 +155,11 @@ app.post("/fix", async (req, res) => {
     const userMsg = context
       ? `Context: ${context}\n\nScript to fix:\n${code}`
       : `Script to fix:\n${code}`;
-    const result = await callClaude(FIX_SYSTEM_PROMPT, [{ role: "user", content: userMsg }], 1600);
+    const result = await callClaude(FIX_SYSTEM_PROMPT, [{ role: "user", content: userMsg }], 2400);
     res.json(result);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Something went wrong." });
+    res.status(500).json({ error: (err && err.message) || "Something went wrong." });
   }
 });
 
@@ -191,7 +215,7 @@ app.post("/build", async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Something went wrong." });
+    res.status(500).json({ error: (err && err.message) || "Something went wrong." });
   }
 });
 
@@ -218,10 +242,10 @@ app.post("/ask", async (req, res) => {
     // Step 1: generate the initial answer
     let parsed;
     try {
-      parsed = sanitize(await callClaude(GENERATE_SYSTEM_PROMPT, messages, 1400));
+      parsed = sanitize(await callClaude(GENERATE_SYSTEM_PROMPT, messages, 3000));
     } catch (e) {
       console.error("Generation step failed:", e);
-      return res.status(502).json({ error: "Model did not return valid JSON." });
+      return res.status(502).json({ error: e.message || "Model did not return valid JSON." });
     }
 
     // Step 2: self-review and fix, up to MAX_REVIEW_PASSES times
@@ -238,7 +262,7 @@ app.post("/ask", async (req, res) => {
               content: `Question: ${latestQuestion}\n\nCode to review:\n${parsed.code}`,
             },
           ],
-          1400
+          3000
         );
       } catch (e) {
         console.error("Review step failed, keeping current code:", e);
@@ -263,7 +287,7 @@ app.post("/ask", async (req, res) => {
     res.json(parsed);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Something went wrong." });
+    res.status(500).json({ error: (err && err.message) || "Something went wrong." });
   }
 });
 
